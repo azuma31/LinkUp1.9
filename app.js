@@ -3,7 +3,7 @@
 // =====================================================
 
 // ★★★ ここにGASのウェブアプリURLを設定してください ★★★
-const GAS_URL = 'https://script.google.com/macros/s/AKfycbx-DdGQBpehNsjOs0oJ5PFPjjGOa2ig3Znp5cYhubIL1L0-h4_5q4tBllx42OmCYzlU/exec';
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbzTssqitUmWhsAg-sfaFaIknvH0tywO6NKLWjYfPTXnVHTfbR7p4qcqdAYH0Fu9Fm6o/exec';
 
 // =====================================================
 // 暗号化ユーティリティ
@@ -122,9 +122,9 @@ class SecureVideoChat {
         this.setupMainEvents();
         this.setupPermissionModal();
 
-        // 既存セッションがあれば自動ログイン
+        // 既存セッションがあれば自動ログイン（サーバー側でトークンを検証してから画面遷移）
         if (this.token && this.myName) {
-            this.enterMainScreen();
+            this.validateSessionAndEnter();
         }
 
         window.addEventListener('beforeunload', () => this.onBeforeUnload());
@@ -298,6 +298,33 @@ class SecureVideoChat {
         this.el.registerPassword.addEventListener('keydown', e => { if (e.key === 'Enter') this.doRegister(); });
     }
 
+    // =====================================================
+    // 起動時セッション検証（タブ再開時に一瞬ログイン状態になるバグ対策）
+    // =====================================================
+    async validateSessionAndEnter() {
+        // 画面はまだ認証画面のまま（enterMainScreenを呼ばない）
+        try {
+            const res = await GasAPI.heartbeat(this.token, '');
+            if (res.ok) {
+                // トークンが有効なのでメイン画面へ
+                this.enterMainScreen();
+            } else {
+                // 無効なトークン → localStorageをクリアして認証画面を表示
+                this.clearLocalSession();
+            }
+        } catch (e) {
+            // ネットワークエラーの場合はオフラインの可能性があるのでそのままログイン画面
+            this.clearLocalSession();
+        }
+    }
+
+    clearLocalSession() {
+        this.token = null;
+        this.myName = null;
+        localStorage.removeItem('svc_token');
+        localStorage.removeItem('svc_name');
+    }
+
     async doLogin() {
         const name = this.el.loginName.value.trim();
         const password = this.el.loginPassword.value.trim();
@@ -433,8 +460,9 @@ class SecureVideoChat {
         // 通話制御
         this.el.disconnectButton.addEventListener('click', () => {
             if (this.isDisconnecting) return;
+            this.el.disconnectButton.disabled = true;
+            this.el.disconnectButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 切断中...';
             this.disconnectedBySelf = true;
-            this.isDisconnecting = true; // 自分から切断 → 相手切断イベントを無視
             this.sendDisconnectSignal().then(() => {
                 this.showDisconnectOverlay('通話を終了しました');
                 this.disconnect();
@@ -505,10 +533,7 @@ class SecureVideoChat {
     doLogout() {
         // ① 先にlocalStorageとトークンをクリアして画面を即切替
         const tokenToInvalidate = this.token;
-        this.token = null;
-        this.myName = null;
-        localStorage.removeItem('svc_token');
-        localStorage.removeItem('svc_name');
+        this.clearLocalSession();
 
         // ② 画面を即座に切替
         this.el.mainScreen.style.display = 'none';
@@ -519,6 +544,10 @@ class SecureVideoChat {
         // ③ クリーンアップ・GASログアウトはバックグラウンドで非同期処理
         this.stopHeartbeat();
         this.stopPolling();
+        if (this._qualityInterval) {
+            clearInterval(this._qualityInterval);
+            this._qualityInterval = null;
+        }
         this.cleanup().catch(() => { });
         if (tokenToInvalidate) {
             GasAPI.logout(tokenToInvalidate).catch(() => { });
@@ -659,7 +688,7 @@ class SecureVideoChat {
     }
 
     // =====================================================
-    // ハートビート（30秒ごと）
+    // ハートビート（10秒ごと）
     // =====================================================
     startHeartbeat() {
         this.stopHeartbeat();
@@ -670,7 +699,7 @@ class SecureVideoChat {
                 const res = await GasAPI.heartbeat(this.token, peerId);
                 if (!res.ok) this.doLogout();
             } catch (_) { }
-        }, 30000);
+        }, 10000); // 10秒ごと（GAS側タイムアウト90秒に対して十分な余裕）
     }
 
     stopHeartbeat() {
@@ -681,10 +710,11 @@ class SecureVideoChat {
     }
 
     // =====================================================
-    // シグナルポーリング（3秒ごと）
+    // シグナルポーリング（2秒ごと）
     // =====================================================
     startPolling() {
         this.stopPolling();
+        this._signalPollCount = 0;
         this.pollingInterval = setInterval(() => this.pollSignals(), 2000);
     }
 
@@ -706,10 +736,14 @@ class SecureVideoChat {
                 await GasAPI.ackSignal(this.token, signal.id);
             }
 
-            // オンラインリストも定期更新（10秒ごと）
-            if (!this._listLastUpdate || Date.now() - this._listLastUpdate > 10000) {
-                this._listLastUpdate = Date.now();
-                await this.refreshOnlineList();
+            // オンラインリストは5回に1回（約10秒ごと）更新
+            this._signalPollCount = (this._signalPollCount || 0) + 1;
+            if (this._signalPollCount >= 5) {
+                this._signalPollCount = 0;
+                // 通話中はリスト更新不要
+                if (!this.currentCall) {
+                    await this.refreshOnlineList();
+                }
             }
         } catch (e) {
             console.warn('ポーリングエラー:', e);
@@ -723,6 +757,25 @@ class SecureVideoChat {
                 // 通話中は自動拒否
                 if (this.currentCall) {
                     await GasAPI.sendSignal(this.token, signal.from, 'call_reject', '通話中');
+                    return;
+                }
+                // 同時申請の競合解決:
+                // 自分も相手に発信中（callingModalが表示中）で、かつ発信先が同じ相手の場合
+                if (this.callTargetName === signal.from &&
+                    this.el.callingModal.classList.contains('visible')) {
+                    // 名前の辞書順で「小さい方」が自動的に受け入れ側になる
+                    if (this.myName < signal.from) {
+                        // 自分が受け入れ側: 自分の発信をキャンセルして相手の着信を受け入れる
+                        clearTimeout(this._callTimeout);
+                        this.el.callingModal.classList.remove('visible');
+                        this.callTargetName = null;
+                        console.log('[同時申請解決] 自分が受け入れ側になります');
+                        this.showIncomingCall(signal);
+                    } else {
+                        // 自分が発信側のまま: 相手の着信申請を無視（相手が受け入れ側になる）
+                        console.log('[同時申請解決] 自分が発信側のまま継続します');
+                        // 相手側が自分のcall_requestに対してcall_acceptを送ってくるまで待機
+                    }
                     return;
                 }
                 this.showIncomingCall(signal);
@@ -769,6 +822,13 @@ class SecureVideoChat {
             return;
         }
 
+        // 押したボタンを申請中状態に変更（二重押し防止）
+        const clickedBtn = this.el.userList.querySelector(`.call-user-btn[data-name="${CSS.escape(targetName)}"]`);
+        if (clickedBtn) {
+            clickedBtn.disabled = true;
+            clickedBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 申請中';
+        }
+
         this.callTargetName = targetName;
         this._targetPeerId = targetPeerId;
         this.el.callingTargetName.textContent = targetName;
@@ -782,11 +842,21 @@ class SecureVideoChat {
             if (!res.ok) {
                 this.el.callingModal.classList.remove('visible');
                 this.showNotification('エラー', '通話申請の送信に失敗しました: ' + (res.error || ''), 'error');
+                // ボタンを元に戻す
+                if (clickedBtn) {
+                    clickedBtn.disabled = false;
+                    clickedBtn.innerHTML = '<i class="fas fa-phone"></i> 通話';
+                }
                 return;
             }
         } catch (e) {
             this.el.callingModal.classList.remove('visible');
             this.showNotification('エラー', '通話申請の送信に失敗しました', 'error');
+            // ボタンを元に戻す
+            if (clickedBtn) {
+                clickedBtn.disabled = false;
+                clickedBtn.innerHTML = '<i class="fas fa-phone"></i> 通話';
+            }
             return;
         }
 
@@ -796,6 +866,11 @@ class SecureVideoChat {
                 this.el.callingModal.classList.remove('visible');
                 this.callTargetName = null;
                 this.showNotification('通知', '通話申請がタイムアウトしました', 'warning');
+                // ボタンを元に戻す（リスト更新されていなければ）
+                if (clickedBtn) {
+                    clickedBtn.disabled = false;
+                    clickedBtn.innerHTML = '<i class="fas fa-phone"></i> 通話';
+                }
             }
         }, 30000);
     }
@@ -804,6 +879,12 @@ class SecureVideoChat {
         clearTimeout(this._callTimeout);
         this.el.callingModal.classList.remove('visible');
         if (this.callTargetName) {
+            // 申請中ボタンを元に戻す
+            const btn = this.el.userList.querySelector(`.call-user-btn[data-name="${CSS.escape(this.callTargetName)}"]`);
+            if (btn) {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-phone"></i> 通話';
+            }
             try {
                 await GasAPI.sendSignal(this.token, this.callTargetName, 'call_reject', 'キャンセル');
             } catch (_) { }
@@ -833,6 +914,7 @@ class SecureVideoChat {
     // =====================================================
     showIncomingCall(signal) {
         this.pendingSignal = signal;
+        this._resetIncomingCallButtons(); // 前回の状態をリセット
         this.el.incomingCallerName.textContent = signal.from;
         this.el.incomingCallModal.classList.add('visible');
 
@@ -845,10 +927,15 @@ class SecureVideoChat {
     }
 
     async acceptIncomingCall() {
+        if (this._incomingCallHandled) return; // 二重タップ防止
+        this._incomingCallHandled = true;
         clearTimeout(this._incomingTimeout);
         this.el.incomingCallModal.classList.remove('visible');
 
-        if (!this.pendingSignal) return;
+        if (!this.pendingSignal) {
+            this._incomingCallHandled = false;
+            return;
+        }
         const signal = this.pendingSignal;
         this.pendingSignal = null;
 
@@ -857,32 +944,45 @@ class SecureVideoChat {
 
         this.callTargetName = signal.from;
         this.el.remoteName.textContent = signal.from;
-        // UI表示はpeer.on('call')のanswerタイミングで行う（発信者がcallを送ってくるまで待つ）
 
         // 自分のピアIDを相手に返す（承認シグナル）
         try {
             await GasAPI.sendSignal(this.token, signal.from, 'call_accept', this.peer.id);
         } catch (e) {
             this.showNotification('エラー', '応答シグナルの送信に失敗しました', 'error');
+            this._incomingCallHandled = false;
             return;
         }
 
         // 着信側はpeer.on('call')で自動的にanswerされるため、ここでは何もしない
         // （発信者がcall_acceptを受け取った後にWebRTC接続を開始する）
         console.log('[着信承認完了] 発信者からのWebRTC着信を待機中...');
+        // フラグは disconnect() 完了後にリセットされる
     }
 
     async rejectIncomingCall() {
+        if (this._incomingCallHandled) return; // 二重タップ防止
+        this._incomingCallHandled = true;
         clearTimeout(this._incomingTimeout);
         this.el.incomingCallModal.classList.remove('visible');
 
-        if (!this.pendingSignal) return;
+        if (!this.pendingSignal) {
+            this._incomingCallHandled = false;
+            return;
+        }
         const signal = this.pendingSignal;
         this.pendingSignal = null;
 
         try {
             await GasAPI.sendSignal(this.token, signal.from, 'call_reject', '拒否');
         } catch (_) { }
+
+        // 次の着信に備えてリセット
+        this._incomingCallHandled = false;
+    }
+
+    _resetIncomingCallButtons() {
+        this._incomingCallHandled = false;
     }
 
     // =====================================================
@@ -916,7 +1016,9 @@ class SecureVideoChat {
 
         this.dataConnection.on('data', async data => {
             if (data && data.type === 'DISCONNECT_SIGNAL') {
-                this.handleRemoteDisconnect('相手が通話を終了しました');
+                if (!this.isDisconnecting) {
+                    this.handleRemoteDisconnect('相手が通話を終了しました');
+                }
                 return;
             }
             try {
@@ -935,6 +1037,10 @@ class SecureVideoChat {
     // 相手側の切断を一元処理（二重発火防止付き）
     handleRemoteDisconnect(reason) {
         if (this.isDisconnecting) return; // すでに処理中なら無視
+        if (this._remoteDisconnectHandled) return; // 複数イベント源からの重複発火を防止
+        this._remoteDisconnectHandled = true;
+        // 通話中でない場合（既に切断済み）も無視
+        if (!this.currentCall && !this.dataConnection) return;
         this.showDisconnectOverlay(reason);
         this.disconnect();
     }
@@ -958,16 +1064,22 @@ class SecureVideoChat {
     async disconnect() {
         if (this.isDisconnecting) return; // 二重実行防止
         this.isDisconnecting = true;
+        // _remoteDisconnectHandled は disconnect() 中はそのまま保持し、
+        // 次の通話開始（initiateWebRTCCall / peer.on('call')）までリセットしない
+
+        // 接続品質モニタリングを停止
+        if (this._qualityInterval) {
+            clearInterval(this._qualityInterval);
+            this._qualityInterval = null;
+        }
 
         await this.cleanup();
 
-        // UI をリストに戻す
+        // UI をリストに戻す（Bug 3: ここを確実に実行する）
         this.el.videoGrid.style.display = 'none';
         this.el.waitingState.style.display = '';
         this.el.callControls.style.display = 'none';
-        this.el.userList.closest
-            ? this.showUserListSection(true)
-            : null;
+        this.showUserListSection(true);
 
         if (this.audioContext) {
             this.audioContext.close();
@@ -984,6 +1096,19 @@ class SecureVideoChat {
         this.isDisconnecting = false;
         this.callTargetName = null;
 
+        // 通話終了ボタンを元の状態に戻す
+        if (this.el.disconnectButton) {
+            this.el.disconnectButton.disabled = false;
+            this.el.disconnectButton.innerHTML = '<i class="fas fa-phone-slash"></i> 通話を終了';
+        }
+
+        // _remoteDisconnectHandledは遅れて来るcloseイベントをブロックするため
+        // 少し遅らせてからリセット（次の通話に備える）
+        setTimeout(() => {
+            this._remoteDisconnectHandled = false;
+            this._incomingCallHandled = false; // 次の着信に備えてリセット
+        }, 1000);
+
         // PeerJSを再初期化してオンライン状態に戻る
         try {
             await this.initializePeer();
@@ -993,7 +1118,6 @@ class SecureVideoChat {
             console.warn('再初期化失敗:', e);
         }
 
-        this.showUserListSection(true);
         await this.refreshOnlineList();
     }
 
@@ -1093,17 +1217,24 @@ class SecureVideoChat {
     // 接続品質モニタリング
     // =====================================================
     startConnectionQualityMonitoring() {
-        setInterval(() => {
-            if (this.currentCall?.peerConnection) {
-                this.currentCall.peerConnection.getStats().then(stats => {
-                    stats.forEach(r => {
-                        if (r.type === 'candidate-pair' && r.state === 'succeeded') {
-                            this.el.connectionQuality.textContent = this.calcQuality(r);
-                        }
-                    });
-                });
+        // 既存のインターバルをクリア（重複防止）
+        if (this._qualityInterval) {
+            clearInterval(this._qualityInterval);
+        }
+        this._qualityInterval = setInterval(() => {
+            if (!this.currentCall?.peerConnection) {
+                clearInterval(this._qualityInterval);
+                this._qualityInterval = null;
+                return;
             }
-        }, 1000);
+            this.currentCall.peerConnection.getStats().then(stats => {
+                stats.forEach(r => {
+                    if (r.type === 'candidate-pair' && r.state === 'succeeded') {
+                        this.el.connectionQuality.textContent = this.calcQuality(r);
+                    }
+                });
+            });
+        }, 2000); // 2秒ごと（1秒は過剰）
     }
 
     calcQuality(stats) {
@@ -1144,7 +1275,7 @@ class SecureVideoChat {
 
     showDisconnectOverlay(reason = '通話が終了しました') {
         const existing = document.getElementById('disconnectOverlay');
-        if (existing) existing.remove();
+        if (existing) return; // すでに表示中なら追加しない
         const overlay = document.createElement('div');
         overlay.id = 'disconnectOverlay';
         overlay.className = 'disconnect-overlay';
@@ -1170,7 +1301,15 @@ class SecureVideoChat {
             try { this.dataConnection.send({ type: 'DISCONNECT_SIGNAL' }); } catch (_) { }
         }
         if (this.token) {
-            try { GasAPI.logout(this.token); } catch (_) { }
+            // sendBeaconを使うとページ離脱時でも確実にリクエストが送られる
+            try {
+                const url = new URL(GAS_URL);
+                url.searchParams.set('action', 'logout');
+                url.searchParams.set('token', this.token);
+                navigator.sendBeacon(url.toString());
+            } catch (_) {
+                try { GasAPI.logout(this.token); } catch (__) { }
+            }
         }
         this.cleanup();
     }
