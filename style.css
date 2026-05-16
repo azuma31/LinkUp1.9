@@ -357,9 +357,15 @@ button:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important;
     display: grid;
     grid-template-columns: 280px 1fr;
     width: 100%;
-    height: 100%;       /* main-content の flex:1 を確実に継承 */
     min-height: 0;
     overflow: hidden;
+}
+
+/* 通話中：サイドバー非表示時はビデオエリアが全幅を占有 */
+.main-layout:has(.users-panel[style*="display: none"]),
+.main-layout:has(.user-list-section[style*="display: none"]),
+.main-layout.in-call {
+    grid-template-columns: 1fr;
 }
 
 /* =====================================================
@@ -490,11 +496,11 @@ button:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important;
     display: flex;
     flex-direction: column;
     padding: 1rem;
-    gap: 1rem;
+    gap: 0.75rem;
     overflow: hidden;
+    flex: 1;
     min-height: 0;
     min-width: 0;
-    height: 100%;       /* グリッドセルの高さを確実に受け取る */
 }
 
 .waiting-state {
@@ -541,7 +547,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important;
     display: grid;
     grid-template-columns: 1fr 1fr;
     grid-template-rows: 1fr;  /* 親の高さを均等に分割 */
-    gap: 1rem;
+    gap: 0.75rem;
     flex: 1;                  /* video-area内の余白をすべて使う */
     min-height: 0;            /* flexアイテムの縮小を許可 */
 }
