@@ -463,9 +463,8 @@ class SecureVideoChat {
             this.el.disconnectButton.disabled = true;
             this.el.disconnectButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> 切断中...';
             this.disconnectedBySelf = true;
-            this.isDisconnecting = true; // 先にフラグを立てて二重発火を防止
-            this.showDisconnectOverlay('通話を終了しました');
             this.sendDisconnectSignal().then(() => {
+                this.showDisconnectOverlay('通話を終了しました');
                 this.disconnect();
             });
         });
@@ -728,14 +727,28 @@ class SecureVideoChat {
 
     async pollSignals() {
         if (!this.token) return;
+        if (this._isPolling) return; // 前のポーリングがまだ実行中ならスキップ
+        this._isPolling = true;
         try {
             const res = await GasAPI.getSignals(this.token);
             if (!res.ok) return;
 
+            // 処理済みシグナルIDセット（重複排除用）
+            if (!this._processedSignalIds) this._processedSignalIds = new Set();
+
             for (const signal of res.signals) {
+                // 同一シグナルIDを二重処理しない
+                if (this._processedSignalIds.has(signal.id)) {
+                    await GasAPI.ackSignal(this.token, signal.id);
+                    continue;
+                }
+                this._processedSignalIds.add(signal.id);
                 await this.handleSignal(signal);
                 await GasAPI.ackSignal(this.token, signal.id);
             }
+
+            // 処理済みIDセットが肥大化しないよう100件超えたらリセット
+            if (this._processedSignalIds.size > 100) this._processedSignalIds.clear();
 
             // オンラインリストは5回に1回（約10秒ごと）更新
             this._signalPollCount = (this._signalPollCount || 0) + 1;
@@ -748,6 +761,8 @@ class SecureVideoChat {
             }
         } catch (e) {
             console.warn('ポーリングエラー:', e);
+        } finally {
+            this._isPolling = false; // 必ず解放
         }
     }
 
@@ -867,8 +882,10 @@ class SecureVideoChat {
     // 着信
     // =====================================================
     showIncomingCall(signal) {
-        // すでに着信モーダルが表示中なら無視（二重表示防止）
+        // すでに同じシグナルIDを処理中、またはモーダル表示中なら無視（二重表示防止）
+        if (this._currentIncomingSignalId === signal.id) return;
         if (this.el.incomingCallModal.classList.contains('visible')) return;
+        this._currentIncomingSignalId = signal.id;
         this.pendingSignal = signal;
         this._resetIncomingCallButtons(); // 前回の状態をリセット
         this.el.incomingCallerName.textContent = signal.from;
@@ -935,10 +952,12 @@ class SecureVideoChat {
 
         // 次の着信に備えてリセット
         this._incomingCallHandled = false;
+        this._currentIncomingSignalId = null;
     }
 
     _resetIncomingCallButtons() {
         this._incomingCallHandled = false;
+        this._currentIncomingSignalId = null;
     }
 
     // =====================================================
@@ -1018,8 +1037,8 @@ class SecureVideoChat {
     }
 
     async disconnect() {
-        if (this.isDisconnecting && !this.disconnectedBySelf) return; // 二重実行防止（自分切断時はフラグ済みなのでそのまま続行）
-        if (!this.isDisconnecting) this.isDisconnecting = true;
+        if (this.isDisconnecting) return; // 二重実行防止
+        this.isDisconnecting = true;
         // _remoteDisconnectHandled は disconnect() 中はそのまま保持し、
         // 次の通話開始（initiateWebRTCCall / peer.on('call')）までリセットしない
 
