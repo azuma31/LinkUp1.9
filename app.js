@@ -3,7 +3,7 @@
 // =====================================================
 
 // ★★★ ここにGASのウェブアプリURLを設定してください ★★★
-const GAS_URL = 'https://script.google.com/macros/s/AKfycbz3GLiBpOmDJarqDUJ0Pxqcyn5OvXoQ5OHHRGl4GJMCIftudLbV6-VICZ7PCnDBMTjt/exec';
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbx-DdGQBpehNsjOs0oJ5PFPjjGOa2ig3Znp5cYhubIL1L0-h4_5q4tBllx42OmCYzlU/exec';
 
 // =====================================================
 // 暗号化ユーティリティ
