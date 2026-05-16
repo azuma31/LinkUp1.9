@@ -107,6 +107,7 @@ class SecureVideoChat {
         this.gainNode = null;
         this.currentVolume = 100;
         this.disconnectedBySelf = false;
+        this.isDisconnecting = false; // 切断処理中フラグ（二重発火防止）
         this.isVolumeControlVisible = false;
         this.isKeyVisible = false;
 
@@ -431,7 +432,9 @@ class SecureVideoChat {
 
         // 通話制御
         this.el.disconnectButton.addEventListener('click', () => {
+            if (this.isDisconnecting) return;
             this.disconnectedBySelf = true;
+            this.isDisconnecting = true; // 自分から切断 → 相手切断イベントを無視
             this.sendDisconnectSignal().then(() => {
                 this.showDisconnectOverlay('通話を終了しました');
                 this.disconnect();
@@ -564,6 +567,7 @@ class SecureVideoChat {
                     this.el.videoGrid.style.display = '';
                     this.el.waitingState.style.display = 'none';
                     this.el.callControls.style.display = '';
+                    this.showUserListSection(false); // 通話中はリストを隠す
                     this.updateStatus('通話中');
                 }
             });
@@ -740,9 +744,8 @@ class SecureVideoChat {
                 break;
 
             case 'call_end':
-                if (!this.disconnectedBySelf) {
-                    this.showDisconnectOverlay(`${signal.from} が通話を終了しました`);
-                    this.disconnect();
+                if (!this.isDisconnecting) {
+                    this.handleRemoteDisconnect(`${signal.from} が通話を終了しました`);
                 }
                 break;
         }
@@ -816,6 +819,7 @@ class SecureVideoChat {
         this.el.videoGrid.style.display = '';
         this.el.waitingState.style.display = 'none';
         this.el.callControls.style.display = '';
+        this.showUserListSection(false); // 通話中はリストを隠す
 
         this.dataConnection = this.peer.connect(remotePeerId);
         this.setupDataConnection();
@@ -895,10 +899,9 @@ class SecureVideoChat {
         });
 
         call.on('close', () => {
-            if (!this.disconnectedBySelf) {
-                this.showDisconnectOverlay('相手が通話を終了しました');
-                this.disconnect();
-            }
+            // isDisconnecting中（自分側のcleanupが原因のclose）は無視
+            if (this.isDisconnecting) return;
+            this.handleRemoteDisconnect('相手が通話を終了しました');
         });
 
         call.peerConnection.oniceconnectionstatechange = () => {
@@ -913,8 +916,7 @@ class SecureVideoChat {
 
         this.dataConnection.on('data', async data => {
             if (data && data.type === 'DISCONNECT_SIGNAL') {
-                this.showDisconnectOverlay('相手が通話を終了しました');
-                this.disconnect();
+                this.handleRemoteDisconnect('相手が通話を終了しました');
                 return;
             }
             try {
@@ -924,15 +926,17 @@ class SecureVideoChat {
         });
 
         this.dataConnection.on('close', () => {
-            if (!this.disconnectedBySelf) {
-                this.showDisconnectOverlay('相手が通話を終了しました');
-                this.disconnect();
-            }
+            // isDisconnecting中（自分側のcleanupが原因のclose）は無視
+            if (this.isDisconnecting) return;
+            this.handleRemoteDisconnect('相手が通話を終了しました');
         });
     }
 
-    handleReceivedData(data) {
-        console.log('Received:', data);
+    // 相手側の切断を一元処理（二重発火防止付き）
+    handleRemoteDisconnect(reason) {
+        if (this.isDisconnecting) return; // すでに処理中なら無視
+        this.showDisconnectOverlay(reason);
+        this.disconnect();
     }
 
     async sendDisconnectSignal() {
@@ -952,11 +956,19 @@ class SecureVideoChat {
     }
 
     async disconnect() {
+        if (this.isDisconnecting) return; // 二重実行防止
+        this.isDisconnecting = true;
+
         await this.cleanup();
+
+        // UI をリストに戻す
         this.el.videoGrid.style.display = 'none';
         this.el.waitingState.style.display = '';
         this.el.callControls.style.display = 'none';
-        this.disconnectedBySelf = false;
+        this.el.userList.closest
+            ? this.showUserListSection(true)
+            : null;
+
         if (this.audioContext) {
             this.audioContext.close();
             this.audioContext = null;
@@ -967,19 +979,53 @@ class SecureVideoChat {
         if (this.el.volumeSliderContainer) this.el.volumeSliderContainer.classList.remove('visible');
         if (this.el.volumeSlider) this.el.volumeSlider.value = 100;
         this.updateStatus('オンライン');
+
+        this.disconnectedBySelf = false;
+        this.isDisconnecting = false;
+        this.callTargetName = null;
+
+        // PeerJSを再初期化してオンライン状態に戻る
+        try {
+            await this.initializePeer();
+            await this.setupLocalStream();
+            this.isMediaReady = true;
+        } catch (e) {
+            console.warn('再初期化失敗:', e);
+        }
+
+        this.showUserListSection(true);
         await this.refreshOnlineList();
     }
 
+    // オンラインユーザーリストの表示/非表示
+    showUserListSection(visible) {
+        const section = document.querySelector('.user-list-section') || this.el.userList?.closest('section') || this.el.userList?.parentElement;
+        if (section) section.style.display = visible ? '' : 'none';
+    }
+
     async cleanup() {
-        if (this.localStream) {
-            this.localStream.getTracks().forEach(t => t.stop());
-            this.localStream = null;
-        }
-        if (this.currentCall) { this.currentCall.close(); this.currentCall = null; }
-        if (this.dataConnection) { this.dataConnection.close(); this.dataConnection = null; }
-        if (this.peer) { this.peer.destroy(); this.peer = null; }
+        // イベントリスナーが再発火しないよう先にnullで参照を切る
+        const call = this.currentCall;
+        const dc = this.dataConnection;
+        const peer = this.peer;
+        const stream = this.localStream;
+
+        this.currentCall = null;
+        this.dataConnection = null;
+        this.peer = null;
+        this.localStream = null;
+
+        if (stream) stream.getTracks().forEach(t => t.stop());
+        if (call) { try { call.close(); } catch (_) { } }
+        if (dc) { try { dc.close(); } catch (_) { } }
+        if (peer) { try { peer.destroy(); } catch (_) { } }
+
         if (this.el.remoteVideo) this.el.remoteVideo.srcObject = null;
         if (this.el.localVideo) this.el.localVideo.srcObject = null;
+    }
+
+    handleReceivedData(data) {
+        console.log('Received:', data);
     }
 
     // =====================================================
@@ -1119,6 +1165,7 @@ class SecureVideoChat {
     }
 
     onBeforeUnload() {
+        this.isDisconnecting = true; // ページ離脱 → 以降のイベントをすべて無視
         if (this.dataConnection?.open !== false) {
             try { this.dataConnection.send({ type: 'DISCONNECT_SIGNAL' }); } catch (_) { }
         }
